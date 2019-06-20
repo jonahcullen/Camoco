@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 
 from setuptools import setup, find_packages, Extension
-from Cython.Distutils import build_ext
-from setuptools.command.develop import develop
-from setuptools.command.install import install
-
-from subprocess import check_call
 
 import os
 import io
@@ -30,15 +25,20 @@ def find_version(*file_paths):
 pccup = Extension(
     'camoco.PCCUP',
     sources=['camoco/PCCUP.pyx'],
-#    extra_compile_args=['-ffast-math'],
+#   extra_compile_args=['-ffast-math'],
     include_dirs=[numpy.get_include()]
 )
 refgendist = Extension(
     'camoco.RefGenDist',
     sources=['camoco/RefGenDist.pyx'],
-#    extra_compile_args=['-ffast-math'],
+#   extra_compile_args=['-ffast-math'],
     include_dirs=[numpy.get_include()]
 )
+
+# Check if running Windows
+if os.name == 'nt':
+    raise ValueError("Camoco isn't supported for windows! Camoco runs best on Linux!")
+    sys.exit(1)
 
 setup(
     name = 'camoco',
@@ -49,26 +49,50 @@ setup(
     ],
     ext_modules = [pccup,refgendist],
     cmdclass = {
-        'build_ext': build_ext,
     },
 
     package_data = {
         '':['*.cyx']    
     },
+    python_requires='>=3.6, <3.7',
+    setup_requires = [
+        # Setuptools 18.0 properly handles Cython extensions.
+        'setuptools>=18.0',
+        #'numpy==1.14.5',
+        'cython',
+    ],
+#   include_dirs=['camoco/include'],
     install_requires = [		
-        'minus80==0.1.3',
-        'flask==0.12.2',
-        'cython==0.16',    		
-        'igraph==0.1.5',		
-        'matplotlib==2.2.2',		
-        'numpy==1.14.5',		
-        'pandas==0.22.0',		
-        'scipy==1.1.0',		
+        'minus80==0.3.3',
+        'cython==0.29.10',    		
+        'igraph==0.1.11',		
+        'pyyaml==5.1.1',
+        'matplotlib==3.1.0',		
+        'numpy==1.16.4',		
+        'scipy==1.2.1',		
+        'pandas==0.23.4',		
+
+        'scikit-learn==0.21.2',
+        'statsmodels==0.8.0',
         'termcolor==1.1.0',
-        'scikit-learn==0.19.1',
-        'powerlaw==1.3.5',
-        'networkx==1.11', 
-        'statsmodels==0.9.0'
+        'powerlaw==1.4.6',
+        'flask==1.0.3',
+        'markov-clustering==0.0.6.dev0',
+        'fastcluster==1.1.25'
+    ],
+    extras_require={
+        'docs' : [
+            'ipython>=6.5.0',
+            'matplotlib>=2.2.3',
+            'numpydoc',
+            'sphinx_materialdesign_theme',
+            'sphinx_rtd_theme',
+            'sphinxcontrib-programoutput'
+        ]
+    },
+    dependency_links = [
+        #'git+https://github.com/LinkageIO/Minus80'
+        #'git+https://github.com/rogerbinns/apsw' 
     ],
     include_package_data=True,
 

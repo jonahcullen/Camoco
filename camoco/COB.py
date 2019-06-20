@@ -1,5 +1,8 @@
 #!/usr/bin/python3
 
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
 import camoco.PCCUP as PCCUP
 
 from .Camoco import Camoco
@@ -14,9 +17,10 @@ from math import isinf
 from numpy import matrix, arcsinh, tanh
 from collections import defaultdict, Counter
 from itertools import chain
+from matplotlib.collections import LineCollection
 from subprocess import Popen, PIPE
 from scipy.spatial.distance import squareform
-from scipy.misc import comb
+from scipy.special import comb
 from scipy.stats import norm,pearsonr
 from scipy.cluster.hierarchy import linkage, leaves_list, dendrogram
 from statsmodels.sandbox.regression.predstd import wls_prediction_std
@@ -29,6 +33,8 @@ import networkx as nx
 import pandas as pd
 import numpy as np
 import itertools
+import fastcluster
+import psutil
 
 from odo import odo
 
@@ -246,12 +252,12 @@ class COB(Expr):
             
             # Keep track of the current threshold
             self._global('current_significance_threshold',zscore)
+            self._calculate_degree(update_db=False)
         
         # Rebuild significant index set
         if new_sig or self.sigs is None:
             self.sigs = np.array([ind for ind in self.coex.data['significant'].wheretrue()])
             self.sigs.sort()
-        self._calculate_degree(update_db=False)
         return None
     
     def _coex_DataFrame(self,ids=None,sig_only=True):
@@ -293,6 +299,7 @@ class COB(Expr):
         # Get the DataFrame
         df = pd.DataFrame.from_items(
             ((key, self.coex.data[key][ids]) for key in self.coex.data.names))
+        #df = odo(self.coex[ids],pd.DataFrame)
         df.set_index(ids,inplace=True)
         return df
     
@@ -539,7 +546,7 @@ class COB(Expr):
             else:
                 df.insert(0,'gene_a',[])
                 df.insert(0,'gene_b',[])
-        if names_as_index:
+        if names_as_index and not names_as_cols:
             df = df.set_index(['gene_a','gene_b'])
         if trans_locus_only:
             try:
@@ -554,38 +561,6 @@ class COB(Expr):
                 zip(df.index.get_level_values(0),df.index.get_level_values(1))
             ]
         return df
-
-    def cluster_coefficient(self, locus_list, flank_limit,
-        trans_locus=True, bootstrap=False, by_gene=True, iter_name=None):
-        '''
-            Calculates the clustering coefficient for genes which span loci.
-
-            Parameters
-            ----------
-            locus_list : iter of Loci
-                an iterable of loci
-            flank_limit : int
-                The number of flanking genes passed to be pulled out
-                for each locus (passed onto the refgen.candidate_genes method)
-            return_mean : bool (default: True)
-                If false, raw edges will be returned
-            bootstrap : bool (default: False)
-                If true, candidate genes will be bootstrapped from the COB
-                reference genome
-            by_gene : bool (default: False)
-                Return a per-gene breakdown of density within the subnetwork.
-            iter_name : str (default: None)
-                Optional string which will be added as a column. Useful for
-                keeping track of bootstraps in an aggregated data frame.
-
-            Returns
-            -------
-            Clustering coefficient of interactions if return_mean is True
-            otherwise a dataframe of trans edges
-
-        '''
-        raise NotImplementedError()
-
 
     def trans_locus_density(self, locus_list,flank_limit,
         return_mean=True, bootstrap=False, by_gene=False,
@@ -779,8 +754,9 @@ class COB(Expr):
             # Get the score table
             self.log('Pulling the scores for the .dat')
             score = self.subnetwork(gene_list, sig_only=sig_only, 
-            min_distance=min_distance, names_as_index=False,
-            names_as_cols=False)
+                min_distance=min_distance, names_as_index=False,
+                names_as_cols=False
+            )
             
             # Drop unecessary columns
             score.drop(['distance','significant'], axis=1, inplace=True)
@@ -978,7 +954,112 @@ class COB(Expr):
             return net
 
 
+    def to_sparse_matrix(self,gene_list=None,min_distance=None,
+            max_edges=None,remove_orphans=False):
+        '''
+            Convert the co-expression interactions to a 
+            scipy sparse matrix.
+
+            Parameters
+            -----
+            gene_list: iter of Loci (default: None)
+                If specified, return only the interactions among
+                loci in the list. If None, use all genes.
+            min_distance : int (default: None)
+                The minimum distance between genes for which to consider
+                co-expression interactions. This filters out cis edges.
+
+            Returns
+            -------
+            A tuple (a,b) where 'a' is a scipy sparse matrix and
+            'b' is a mapping from gene_id to index.
+        '''
+        from scipy import sparse
+        self.log('Getting genes')
+        # first get the subnetwork in pair form
+        self.log('Pulling edges')
+        edges = self.subnetwork(
+            gene_list=gene_list, min_distance=min_distance,
+            sig_only=True, names_as_cols=True, names_as_index=False
+        )
+        # Option to limit the number of edges 
+        if max_edges is not None:
+            self.log('Filtering edges')
+            edges = edges.sort_values(by='score',ascending=False)[0:min(max_edges,len(edges))]
+        # Option to restrict gene list to only genes with edges
+        if remove_orphans:
+            self.log('Removing orphans')
+            not_orphans = set(edges.gene_a).union(edges.gene_b)
+            gene_list = [g for g in gene_list if g.id in not_orphans]
+        # Create a gene index
+        self.log('Creating Index')
+        if gene_list == None:
+            gene_list = list(self.refgen.iter_genes())
+        else:
+            gene_list = set(gene_list)
+        gene_index = {g.id:i for i,g in enumerate(gene_list)}
+        nlen = len(gene_list)
+        # get the expression matrix indices for all the genes
+        row = [gene_index[x] for x in edges.gene_a.values]
+        col = [gene_index[x] for x in edges.gene_b.values]
+        data = list(edges.score.values)
+        # Make the values symmetric by doubling everything
+        # Note: by nature we dont have cycles so we dont have to
+        #   worry about the diagonal
+        self.log('Making matrix symmetric')
+        d = data + data
+        r = row + col
+        c = col + row
+        self.log('Creating matrix')
+        matrix = sparse.coo_matrix((d,(r,c)), shape=(nlen,nlen),dtype=None)
+        return (matrix,gene_index)
+
     def mcl(self, gene_list=None, I=2.0, scheme=7, min_distance=None,
+            min_cluster_size=0, max_cluster_size=10e10):
+        '''
+            Returns clusters (as list) as designated by MCL (Markov Clustering).
+
+            Parameters
+            ----------
+            gene_list : a gene iterable
+                These are the genes which will be clustered
+            I : float (default: 2.0)
+                This is the inflation parameter passed into mcl.
+            min_distance : int (default: None)
+                The minimum distance between genes for which to consider
+                co-expression interactions. This filters out cis edges.
+            min_cluster_size : int (default: 0)
+                The minimum cluster size to return. Filter out clusters smaller
+                than this.
+            max_cluster_size : float (default: 10e10)
+                The maximum cluster size to return. Filter out clusters larger
+                than this.
+
+            Returns
+            -------
+            A list clusters containing a lists of genes within each cluster
+        '''
+        # Inspired by https://github.com/networkx/networkx/blob/master/networkx/convert_matrix.py
+        import markov_clustering as mc
+        matrix,gene_index = self.to_sparse_matrix(gene_list=gene_list)
+        # Run MCL
+        result = mc.run_mcl(matrix)
+        clusters = mc.get_clusters(result)
+        # MCL traditionally returns clusters by size with 0 being the largest
+        clusters = sorted(clusters,key=lambda x: len(x), reverse=True)
+        # Create a dictionary to map ids to gene names
+        gene_id_index = {v:k for k,v in gene_index.items()}
+        result = []
+        for c in clusters:
+            if len(c) < min_cluster_size or len(c) > max_cluster_size:
+                continue
+            # convert to loci
+            loci = self.refgen.from_ids([gene_id_index[i] for i in c])
+            result.append(loci)
+        return result     
+        
+
+    def _mcl_legacy(self, gene_list=None, I=2.0, scheme=7, min_distance=None,
             min_cluster_size=0, max_cluster_size=10e10):
         '''
             A *very* thin wrapper to the MCL program. The MCL program must
@@ -1036,7 +1117,10 @@ class COB(Expr):
                     )
                 )
             else:
-                raise ValueError( "MCL failed: return code: {}".format(p.returncode))
+                if p.returncode == 127:
+                    raise FileNotFoundError()
+                else:
+                    raise ValueError( "MCL failed: return code: {}".format(p.returncode))
         except FileNotFoundError as e:
             self.log('Could not find MCL in PATH. Make sure its installed and shell accessible as "mcl".')
 
@@ -1092,7 +1176,7 @@ class COB(Expr):
             if isinstance(gene_list, Locus):
                 if trans_locus_only:
                     raise ValueError('Cannot calculate cis degree on one gene.')
-                return self.degree.ix[gene_list.id].Degree
+                return self.degree.loc[gene_list.id].Degree
             else:
                 degree = self.degree.ix[[x.id for x in gene_list]].fillna(0)
                 if trans_locus_only:
@@ -1174,19 +1258,219 @@ class COB(Expr):
         if iter_name is not None:
             degree['iter_name'] = iter_name
         return degree
+    
+    ''' ----------------------------------------------------------------------
+        Cluster Methods
+    '''
+    def cluster_genes(self,cluster_id):
+        '''
+            Return the genes that are in a cluster
+
+            Parameters
+            ----------
+            cluster_id: str / int
+                The ID of the cluster for which to get the gene IDs.
+                Technically a string, but MCL clusters are assigned
+                numbers. This is automatically converted so '0' == 0.
+
+            Returns
+            -------
+            A list of Loci (genes) that are in the cluster
+        '''
+        ids = self.clusters.query(f'cluster == {cluster_id}').index.values
+        return self.refgen[ids]
+
+    def cluster_coordinates(self, cluster_number, nstd=2):
+        '''
+            Calculate the rough coordinates around an MCL 
+            cluster.
+
+            Returns parameters that can be used to draw an ellipse.
+            e.g. for cluster #5
+            >>> from matplotlib.patches import Ellipse
+            >>> e = Ellipse(**self.cluster_coordinates(5))
+
+        '''
+        # Solution inspired by: 
+        # https://stackoverflow.com/questions/12301071/multidimensional-confidence-intervals
+        # Get the coordinates of the MCL cluster
+        coor = self.coordinates()
+        gene_ids = [x.id for x in self.cluster_genes(cluster_number)]
+        points = coor.loc[gene_ids]
+        points = points.iloc[np.logical_not(np.isnan(points.x)).values,:]
+        # Calculate stats for eigenvalues
+        pos = points.mean(axis=0)
+        cov = np.cov(points, rowvar=False)
+        def eigsorted(cov):
+            vals, vecs = np.linalg.eigh(cov)
+            order = vals.argsort()[::-1]
+            return vals[order], vecs[:,order]
+        vals, vecs = eigsorted(cov)
+        theta = np.degrees(np.arctan2(*vecs[:,0][::-1]))
+        width, height = 2 * nstd * np.sqrt(vals)
+        return {
+            'xy': pos,
+            'width': width,
+            'height': height,
+            'angle' : theta
+        }
+
+    def cluster_expression(self,min_cluster_size=10,normalize=True):
+        '''
+            Get a matrix of cluster x accession gene expression.
+            Each row represents the average gene expression in each accession
+            for the genes in the cluster.
+
+            Parameters
+            ----------
+            min_cluster_size : int (default:10)
+                Clusters smaller than this will not be included in the
+                expression matrix.
+            normalize : bool (default:True)
+                If true, each row will be standard normalized meaning that
+                0 will represent the average (mean) across all accessions
+                and the resultant values in the row will represent the number 
+                of standard deviations from the mean.
+
+            Returns
+            -------
+            A DataFrame containing gene expression values. Each row represents
+            a cluster and each column represents an accession. The values of
+            the matrix are the average gene expression (of genes in the cluster)
+            for each accession.
+
+        '''
+        # Extract clusters
+        dm = self.clusters.groupby('cluster').\
+                filter(lambda x: len(x) >= min_cluster_size).\
+                groupby('cluster').\
+                apply(lambda x: self.expr(genes=self.refgen[x.index]).mean())
+        if normalize:
+            dm = dm.apply(lambda x: (x-x.mean())/x.std() ,axis=1)
+        if len(dm) == 0:
+            self.log.warn('No clusters larger than {} ... skipping',min_cluster_size)
+            return None
+        return dm
 
 
+    def coordinates(self,iterations=50,force=False,max_edges=100000,lcc_only=True):
+        ''' 
+            returns the static layout, you can change the stored layout by
+            passing in a new layout object. If no layout has been stored or a gene
+            does not have coordinates, returns (0, 0) for each mystery gene
+        '''
+        from fa2 import ForceAtlas2
+        forceatlas2 = ForceAtlas2(
+            outboundAttractionDistribution=False, linLogMode=False,
+            adjustSizes=False, edgeWeightInfluence=1.0,
+            jitterTolerance=1.0, barnesHutOptimize=True,
+            barnesHutTheta=1.2, multiThreaded=False,
+            scalingRatio=2.0, strongGravityMode=False,
+            gravity=1.0, verbose=True
+        )
+        pos = self._bcolz('coordinates')
+        if pos is None or force == True:
+            import scipy.sparse.csgraph as csgraph
+            import networkx
+            A,i = self.to_sparse_matrix(remove_orphans=False,max_edges=max_edges)
+            # generate a reverse lookup for index to label
+            rev_i = {v:k for k,v in i.items()}
+            num,ccindex = csgraph.connected_components(A,directed=False)
+            # convert to csc
+            self.log(f'Converting to compressed sparse column')
+            L = A.tocsc()
+            if lcc_only:
+                self.log('Extracting largest connected component')
+                lcc_index,num = Counter(ccindex).most_common(1)[0]
+                L = L[ccindex == lcc_index,:][:,ccindex == lcc_index]
+                self.log(f'The largest CC has {num} nodes')
+                # get labels based on index in L
+                (lcc_indices,) = np.where(ccindex == lcc_index)
+                labels = [rev_i[x] for x in lcc_indices]
+            else:
+                labels = [rev_i[x] for x in range(L.shape[0])]
+            self.log('Calculating positions')
+            #coordinates = networkx.layout._sparse_fruchterman_reingold(L,iterations=iterations)
+            coordinates = positions = forceatlas2.forceatlas2(L,pos=None,iterations=iterations)
+            pos = pd.DataFrame(
+                coordinates
+            )
+            pos.index = labels
+            pos.columns = ['x','y']
+            self._bcolz('coordinates',df=pos)
+        return pos
 
     ''' ----------------------------------------------------------------------
         Plotting Methods
     '''
 
-    def plot(self, filename=None, genes=None,accessions=None,
+    def plot_network(self,
+        filename=None,
+        genes=None,
+        lcc_only=True,
+        force=False,
+        plot_clusters=True,
+        min_cluster_size=100, 
+        max_clusters=None,
+        background_color=None
+    ):
+        '''
+
+        '''
+        coor = self.coordinates(
+            lcc_only=lcc_only,
+            force=force
+        )
+        fig = plt.figure(
+            facecolor='white',
+            figsize=(20,20)
+        )
+        ax = fig.add_subplot(111)
+        # Plot the background genes
+        ax.set_facecolor('white')
+        ax.grid(False) 
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.scatter(coor.x,coor.y,alpha=1,color=background_color)
+        # Plot the genes
+        if genes is not None:
+            ids = coor.loc[[x.id for x in genes if x.id in coor.index]] 
+            ax.scatter(ids.x,ids.y,color='g')
+        # Plot clusters
+        if plot_clusters:
+            from matplotlib.patches import Ellipse
+            big_clusters = [
+                k for k,v in Counter(self.clusters.cluster).items()\
+                if v > min_cluster_size
+            ]
+            for i,clus in enumerate(big_clusters):
+                if max_clusters is not None and i+1 > max_clusters:
+                    break
+                ids = [x.id for x in self.cluster_genes(clus) if x.id in coor.index]
+                ccoor = coor.loc[ids]
+                ax.scatter(ccoor.x,ccoor.y)
+                try:
+                    c = self.cluster_coordinates(clus)
+                except KeyError as e:
+                    continue
+                c.update({
+                    'edgecolor':'black',
+                    'fill':False,
+                    'linestyle':':',
+                    'linewidth':3
+                })
+                e = Ellipse(**c)
+                ax.add_artist(e)
+        if filename is not None:
+            plt.savefig(filename)
+        return fig
+
+    def plot_heatmap(self, filename=None, genes=None,accessions=None,
              gene_normalize=True, raw=False,
-             cluster_method='mcl', include_accession_labels=None,
+             cluster_method='ward', include_accession_labels=None,
              include_gene_labels=None, avg_by_cluster=False,
              min_cluster_size=10, cluster_accessions=True,
-             plot_dendrogram=False):
+             plot_dendrogram=True,nan_color='black'):
         '''
             Plots a heatmap of genes x expression.
 
@@ -1204,11 +1488,13 @@ class COB(Expr):
             raw : bool (default: False)
                 If true, raw expression data will be used. Default is to use
                 the normailzed, QC'd data.
-            cluster_method : str (default: mcl)
+            cluster_method : str (default: 'single')
                 Specifies how to organize the gene axis in the heatmap. If
-                'mcl', genes will be organized by MCL cluster. If 'leaf', 
-                genes will be organized based on hierarchical clustering,
-                any other value will result in genes to be in sorted order.
+                'mcl', genes will be organized by MCL cluster. Otherwise
+                the value must be one of the linkage methods defined by 
+                the scipy.cluster.hierarchy.linkage function: [single,
+                complete, average, weighted, centroid, median, ward].
+                https://docs.scipy.org/doc/scipy/reference/generated/scipy.cluster.hierarchy.linkage.html
             include_accession_labels : bool (default: None)
                 Force the rendering of accession labels. If None, accession 
                 lables will be included as long as there are less than 30.
@@ -1216,7 +1502,7 @@ class COB(Expr):
                 Force rendering of gene labels in heatmap. If None, gene
                 labels will be rendered as long as there are less than 100.
             avg_by_cluster : bool (default: False)
-                If True, gene expression values will be averaged by cluster
+                If True, gene expression values will be averaged by MCL cluster
                 showing a single row per cluster.
             min_cluster_size : int ( default: 10)
                 If avg_by_cluster, only cluster sizes larger than min_cluster_size
@@ -1225,52 +1511,55 @@ class COB(Expr):
                 If true, accessions will be clustered
             plot_dendrogram : bool (default: True)
                 If true, dendrograms will be plotted
+            nan_color : str (default: 'black')
+                Specifies the color of nans in the heatmap. Changing this
+                to a high contrast color can help identify problem areas.
+                Otherwise, black represents 'background' level of expression
+                and is otherwise innocuous.
 
             Returns
             -------
             a populated matplotlib figure object
 
         '''
-        # Get leaves of genes
-        dm = self.expr(genes=genes,accessions=accessions,
-                raw=raw,gene_normalize=gene_normalize)
-        if cluster_method == 'leaf':
+        # These are valid hierarchical clustering methods
+        hier_cluster_methods = [
+            'single','complete','average','weighted','centroid','median','ward'
+        ]
+        # Get the Expressiom Matrix
+        if avg_by_cluster == True:
+            dm = self.cluster_expression(min_cluster_size=min_cluster_size,normalize=True)
+        else:
+            # Fetch the Expr Matrix
+            dm = self.expr(
+                genes=genes, accessions=accessions,
+                raw=raw, gene_normalize=gene_normalize
+            )
+        # Get the Gene clustering order
+        if cluster_method in hier_cluster_methods: 
             self.log('Ordering rows by leaf')
-            order = self._bcolz('leaves').loc[dm.index].\
-                    fillna(np.inf).sort_values(by='index').index.values
+            expr_linkage = fastcluster.linkage(dm.fillna(0),method=cluster_method) 
+            order = leaves_list(expr_linkage)
+            dm = dm.iloc[order, :]
         elif cluster_method == 'mcl':
             self.log('Ordering rows by MCL cluster')
-            order = self._bcolz('clusters').loc[dm.index].\
+            order = self.clusters.loc[dm.index].\
                     fillna(np.inf).sort_values(by='cluster').index.values
+            dm = dm.loc[order, :]
         else:
             # No cluster order.
-            self.log('Unknown row ordering: {}, no ordering performed', cluster_method)
-            order = dm.index
-        # rearrange expression by leaf order
-        dm = dm.loc[order, :]
-        # Optional Average by cluster
-        if avg_by_cluster == True:
-            # Extract clusters
-            dm = self.clusters.groupby('cluster').\
-                    filter(lambda x: len(x) >= min_cluster_size).\
-                    groupby('cluster').\
-                    apply(lambda x: self.expr(genes=self.refgen[x.index]).mean()).\
-                    apply(lambda x: (x-x.mean())/x.std() ,axis=1)
-            if len(dm) == 0:
-                self.log.warn('No clusters larger than {} ... skipping',min_cluster_size)
-                return None
+            self.log('Unknown gene ordering: {}, no ordering performed', cluster_method)
+
         # Get leaves of accessions
         if cluster_accessions:
-            accession_pccs = (1 - PCCUP.pair_correlation(
-                np.ascontiguousarray(
-                    # PCCUP expects floats
-                    self._expr.as_matrix().T.astype('float')
-                )
-            ))
-            accession_link = linkage(1-accession_pccs, method='single')
-            accession_dists = leaves_list(accession_link)
-            # Order by accession distance
-            dm = dm.loc[:,dm.columns[accession_dists]]
+            if cluster_method == 'mcl':
+                acc_clus_method = 'ward'
+            else:
+                acc_clus_method = cluster_method
+            accession_linkage = fastcluster.linkage(dm.fillna(0).T,method=acc_clus_method)
+            # Re-order the matrix based on tree
+            order = leaves_list(accession_linkage)
+            dm = dm.iloc[:,order]
         # Save plot if provided filename
         if plot_dendrogram == False:
             fig = plt.figure(
@@ -1279,52 +1568,67 @@ class COB(Expr):
             )
             ax = fig.add_subplot(111)
         else:
-            gs = gridspec.GridSpec(
+            fig = plt.figure(facecolor='white',figsize=(20,20))
+            gs = fig.add_gridspec(
                 2, 2, 
                 height_ratios=[3,1], 
                 width_ratios=[3,1],
-                hspace=0, wspace=0
+                hspace=0, wspace=0,
             )
             ax = plt.subplot(gs[0])
             # make the axes for the dendrograms
-            right_ax   = plt.subplot(gs[1])
-            right_ax.set_xticks([])
-            right_ax.set_yticks([])
-            bottom_ax = plt.subplot(gs[2])
+            gene_ax = plt.subplot(gs[1])
+            gene_ax.set_xticks([])
+            gene_ax.set_yticks([])
+            accession_ax = plt.subplot(gs[2])
         # Plot the Expression matrix 
         nan_mask = np.ma.array(dm, mask=np.isnan(dm))
         cmap = self._cmap
-        cmap.set_bad('grey', 1.0)
+        cmap.set_bad(nan_color, 1.0)
         vmax = max(np.nanmin(abs(dm)), np.nanmax(abs(dm)))
         vmin = vmax*-1
-        im = ax.matshow(dm, aspect='auto', cmap=cmap, vmax=vmax, vmin=vmin)
+        im = ax.matshow(nan_mask, aspect='auto', cmap=cmap, vmax=vmax, vmin=vmin)
+        ax.grid(False) 
+        ax.tick_params(labelsize=4)
+        ax.tick_params('x',labelrotation=45)
+        ax.set(
+            xticklabels=dm.columns.values,
+            yticklabels=dm.index.values,
+        )
         # Intelligently add labels
-        if (include_accession_labels is None and len(dm.columns) < 30) \
+        if (include_accession_labels is None and len(dm.columns) < 60) \
             or include_accession_labels == True:
                 ax.set(
                     xticks=np.arange(len(dm.columns)),
-                    xticklabels=dm.columns.values
                 )
-                ax.set_xticklabels(dm.columns, rotation=90)
         if (include_gene_labels is None and len(dm.index) < 100) \
             or include_gene_labels == True:
                 ax.set(
                     yticks=np.arange(len(dm.index)),
-                    yticklabels=dm.index.values
                 )
+        fig.align_labels()
         #ax.figure.colorbar(im)
-        if plot_dendrogram == True:
-            # Plot the accession dendrogram
-            dendrogram(accession_link,ax=bottom_ax,orientation='bottom')
-            bottom_ax.set_xticks([])
-            bottom_ax.set_yticks([])
-            # Plot the gene dendrogram
-            import sys
-            sys.setrecursionlimit(100000)
-            gene_link = self._calculate_gene_hierarchy()
-            dendrogram(gene_link,ax=right_ax,orientation='right')
-            right_ax.set_xticks([])
-            right_ax.set_yticks([])
+        if plot_dendrogram == True:   
+            with plt.rc_context({'lines.linewidth': 0.5}):
+                from scipy.cluster import hierarchy
+                hierarchy.set_link_color_palette(['k'])
+    
+                # Plot the accession dendrogram
+                import sys
+                sys.setrecursionlimit(10000)
+                dendrogram(
+                    accession_linkage,ax=accession_ax,color_threshold=np.inf,
+                    orientation='bottom'
+                )
+                accession_ax.set_facecolor('w')
+                accession_ax.set_xticks([])
+                accession_ax.set_yticks([])
+                # Plot the gene dendrogram
+                if cluster_method != 'mcl':
+                    dendrogram(expr_linkage,ax=gene_ax,orientation='right',color_threshold=np.inf)
+                    gene_ax.set_xticks([])
+                    gene_ax.set_yticks([])
+                    gene_ax.set_facecolor('w')
         # Save if you wish
         if filename is not None:
             plt.savefig(filename,dpi=300,figsize=(20,20))
@@ -1447,7 +1751,7 @@ class COB(Expr):
 
         # Find the stats beteween the two sets,
         # and the genes with the biggest differences
-        delta.sort(ascending=False)
+        delta.sort_values(ascending=False,inplace=True)
         highest = sorted(
             list(dict(delta[:diff_genes]).items()),
             key=lambda x: x[1], reverse=True
@@ -1463,7 +1767,6 @@ class COB(Expr):
             ('bigger_in_'+self.name):highest,
             ('bigger_in_'+obj.name):lowest
         }
-
         return ans
 
 
@@ -1478,6 +1781,9 @@ class COB(Expr):
         '''
         # 1. Calculate the PCCs
         self.log("Calculating Coexpression")
+        num_bytes_needed = comb(self.shape()[0],2) * 8
+        if num_bytes_needed > psutil.virtual_memory().available:
+            raise MemoryError("Not enough RAM to calculate co-expression network")
         pccs = (1 - PCCUP.pair_correlation(
             np.ascontiguousarray(
                 # PCCUP expects floats
@@ -1490,6 +1796,13 @@ class COB(Expr):
         pccs[pccs <= -1.0] = -0.9999999
         pccs = np.arctanh(pccs)
         gc.collect();
+    
+        # Do a PCC check to make sure they are not all NaNs
+        if not any(np.logical_not(np.isnan(pccs))):
+            raise ValueError(
+               "Not enough data is available to reliably calculate co-expression, "
+               "please ensure you have more than 10 accessions to calculate correlation coefficient"
+            )
         
         self.log("Calculating Mean and STD")
         # Sometimes, with certain datasets, the NaN mask overlap
@@ -1567,8 +1880,9 @@ class COB(Expr):
             -----
             This is kind of expenive.
         '''
+        import fastcluster
         # We need to recreate the original PCCs
-        self.log('Calculating Leaves using {}'.format(method))
+        self.log('Calculating hierarchical clustering using {}'.format(method))
         if len(self.coex) == 0:
             raise ValueError('Cannot calculate leaves without coex')
         pcc_mean = float(self._global('pcc_mean'))
@@ -1583,7 +1897,7 @@ class COB(Expr):
         dists[np.isnan(dists)] = 0
         gc.collect()
         # Find the leaves from hierarchical clustering
-        gene_link = linkage(dists, method=method)
+        gene_link = fastcluster.linkage(dists, method=method)
         return gene_link
 
     def _calculate_leaves(self,method='single'):
@@ -1707,6 +2021,50 @@ class COB(Expr):
         return self
 
     @classmethod
+    def from_COBs(cls, cobs, name, description,
+                  refgen, rawtype=None, 
+                  zscore_cutoff=3, **kwargs):
+        '''
+            This method will combine the expression tables from
+            an iterable to COBs in order to create a new co-expression
+            network.
+
+            Parameters
+            ----------
+            cobs : iterable to camoco.COB objects
+                The co-expression networks to combine
+                expression data from
+            name : str
+                The name of the resultant COB
+            description : str
+                A short description of the COB
+            refgen : camoco.RefGen
+                A Camoco refgen object which describes the reference
+                genome referred to by the genes in the dataset. This
+                is cross references during import so we can pull information
+                about genes we are interested in during analysis.
+            rawtype : str (default: None)
+                This is noted here to reinforce the impotance of the rawtype
+                passed to camoco.Expr.from_DataFrame. See docs there
+                for more information.
+            zscore_cutoff : int (defualt: 3)
+                The zscore cutoff for the network.
+            \*\*kwargs : key,value pairs
+                additional parameters passed to subsequent methods.
+                (see Expr.from_DataFrame)
+
+        '''
+        dfs = [c.expr(raw=True) for c in cobs]
+        for cob,df in zip(cobs,dfs):
+            df.columns = [f'{acc}_{cob.name}' for acc in df.columns]
+        all_expr = pd.concat(dfs,axis=1,sort=False)
+        # Call the internal from_dataframe method 
+        return cls.from_DataFrame(
+            all_expr, name, description, refgen, rawtype,
+            zscore_cutoff=zscore_cutoff, **kwargs
+        )
+
+    @classmethod
     def from_DataFrame(cls, df, name, description,
                        refgen, rawtype=None, 
                        zscore_cutoff=3, **kwargs):
@@ -1806,97 +2164,6 @@ class COB(Expr):
             zscore_cutoff=zscore_cutoff,
             **kwargs
         )
-
-
-    '''
-        Unimplemented ---------------------------------------------------------------------------------
-    '''
-
-    def coordinates(self, gene_list, layout=None):
-        ''' returns the static layout, you can change the stored layout by
-            passing in a new layout object. If no layout has been stored or a gene
-            does not have coordinates, returns (0, 0) for each mystery gene'''
-        raise NotImplementedError()
-
-
-def _sparse_fruchterman_reingold(A, dim=2, k=None, pos=None, fixed=None, 
-                                 iterations=50):
-    '''
-        Copyright (C) 2004-2016, NetworkX Developers
-        Aric Hagberg <hagberg@lanl.gov>
-        Dan Schult <dschult@colgate.edu>
-        Pieter Swart <swart@lanl.gov>
-        All rights reserved.
-    '''
-    # Position nodes in adjacency matrix A using Fruchterman-Reingold  
-    # Entry point for NetworkX graph is fruchterman_reingold_layout()
-    # Sparse version
-    try:
-        import numpy as np
-    except ImportError:
-        raise ImportError("_sparse_fruchterman_reingold() requires numpy: http://scipy.org/ ")
-    try:
-        nnodes,_=A.shape
-    except AttributeError:
-        raise nx.NetworkXError(
-            "fruchterman_reingold() takes an adjacency matrix as input")
-    try:
-        from scipy.sparse import spdiags,coo_matrix
-    except ImportError:
-        raise ImportError("_sparse_fruchterman_reingold() scipy numpy: http://scipy.org/ ")
-    # make sure we have a LIst of Lists representation
-    try:
-        A=A.tolil()
-    except:
-        A=(coo_matrix(A)).tolil()
-
-    if pos==None:
-        # random initial positions
-        pos=np.asarray(np.random.random((nnodes,dim)),dtype=A.dtype)
-    else:
-        # make sure positions are of same type as matrix
-        pos=pos.astype(A.dtype)
-
-    # no fixed nodes
-    if fixed==None:
-        fixed=[]
-
-    # optimal distance between nodes
-    if k is None:
-        k=np.sqrt(1.0/nnodes)
-    # the initial "temperature"  is about .1 of domain area (=1x1)
-    # this is the largest step allowed in the dynamics.
-    t=0.1
-    # simple cooling scheme.
-    # linearly step down by dt on each iteration so last iteration is size dt.
-    dt=t/float(iterations+1)
-
-    displacement=np.zeros((dim,nnodes))
-    for iteration in range(iterations):
-        displacement*=0
-        # loop over rows
-        for i in range(A.shape[0]):
-            if i in fixed:
-                continue
-            # difference between this row's node position and all others
-            delta=(pos[i]-pos).T
-            # distance between points
-            distance=np.sqrt((delta**2).sum(axis=0))
-            # enforce minimum distance of 0.01
-            distance=np.where(distance<0.01,0.01,distance)
-            # the adjacency matrix row
-            Ai=np.asarray(A.getrowview(i).toarray())
-            # displacement "force"
-            displacement[:,i]+=\
-                (delta*(k*k/distance**2-Ai*distance/k)).sum(axis=1)
-        # update positions
-        length=np.sqrt((displacement**2).sum(axis=0))
-        length=np.where(length<0.01,0.1,length)
-        pos+=(displacement*t/length).T
-        # cool temperature
-        t-=dt
-    return pos
-
 
 def fix_val(val):
     if isinf(val):

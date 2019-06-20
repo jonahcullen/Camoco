@@ -1,5 +1,4 @@
 #! /usr/bin/python3
-
 from .Camoco import Camoco
 from .RefGen import RefGen
 from .Tools import memoize
@@ -155,6 +154,7 @@ class Expr(Camoco):
             df = df[accessions]
         if gene_normalize:
             df = df.apply(
+                # Axis: 1 applies to ROWS!
                 lambda row: (row-row.mean())/row.std(), axis=1
             )
         return df
@@ -225,9 +225,9 @@ class Expr(Camoco):
         '''
         # update the transformation log
         if len(set(df.columns)) != len(df.columns):
-            raise CamocoGeneNameError('Gene names not Unique.')
+            raise CamocoAccessionNameError('Accession names must be unique')
         if len(set(df.index)) != len(df.index):
-            raise CamocoAccessionNameError('Accession names not Unique')
+            raise CamocoGeneNameError('Gene names must be unique.')
         self._transformation_log(transform_name)
         if raw == True:
             table = 'raw_expr'
@@ -347,11 +347,10 @@ class Expr(Camoco):
             self.log("Dataset already normalized")
             self._transformation_log('DetectedPreNormalized')
         elif any(self.is_normalized(max_val=max_val)):
-            # Something fucked up is happending
             raise TypeError(
                 ('Attempting normalization on already normalized'
-                ' dataset. Consider passing a max_val ({}) '
-                '< {} if Im wrong.').format(max_val, min(self.max_values())))
+                ' dataset. Consider passing a --max_val '
+                '< {} if Im wrong.').format( min(self.max_values())))
         else:
             df = self._expr
             if norm_method is not None:
@@ -384,7 +383,7 @@ class Expr(Camoco):
 
             Parameters
             ----------
-            min_expr : int (default: 1)
+            min_expr : int (default: 0.01)
                 FPKM (or equivalent) values under this threshold will be set to
                 NaN and not used during correlation calculations.
             max_gene_missing_data : float (default: 0.2)
@@ -445,7 +444,7 @@ class Expr(Camoco):
         # Presence absence variable et
         if presence_absence == True:
            self.log("Allowing for presence absence variation")
-           #find out which values equalt 0
+           #find out which values equal 0
            zero_index = df_flt == 0
         # Filter the min expression genes
         df_flt[df < min_expr] = np.nan
@@ -499,7 +498,7 @@ class Expr(Camoco):
         qc_accession['PASS_ALL'] = qc_accession.apply(
             lambda row: np.all(row), axis=1
         )
-        df = df.loc[:, qc_accession['PASS_ALL'].index.values]
+        df = df.loc[:, qc_accession['PASS_ALL']]
         # Update the database
         self._bcolz('qc_accession', df=qc_accession)
         self._bcolz('qc_gene', df=qc_gene)
@@ -544,18 +543,16 @@ class Expr(Camoco):
         '''
         self.log('------------ Quantile ')
         if 'quantile' in self._transformation_log():
-            raise ValueError('Quanitle already performed on {}', self.name)
+            raise ValueError('Quantile already performed on {}', self.name)
         # Retrieve current expression DataFrame
         expr = self.expr()
         self.log('Ranking data')
         for accession_name,values in expr.iteritems():
             rank_ties = max(Counter(values).values())
-            if rank_ties > len(values) * 0.10:
+            if rank_ties > len(values) * 0.20:
                 raise ValueError(
-                    '{}:{} has {} ({}%) rank ties'.format(
-                        self.name, accession_name,
-                        rank_ties, rank_ties/len(values)
-                    )
+                    f'{self.name}:{accession_name} has {rank_ties} '
+                    f'({rank_times/len(values)}%) rank ties'
                 )
         # assign ranks by accession (column)
         expr_ranks = expr.rank(axis=0, method='first', na_option='keep')
@@ -618,7 +615,7 @@ class Expr(Camoco):
         '''
             Used for the heatmap function. Retruns a matplotlib cmap which is yellow/blue
         '''
-        heatmapdict = {
+        white_middle_heatmapdict = {
             'red': ((0.0, 1.0, 1.0),
                     (0.5, 1.0, 1.0),
                     (1.0, 0.0, 0.0)),
@@ -627,6 +624,17 @@ class Expr(Camoco):
                     (1.0, 0.0, 0.0)),
             'blue': ((0.0, 0.0, 0.0),
                     (0.5, 1.0, 1.0),
+                    (1.0, 1.0, 1.0))
+        }
+        heatmapdict = {
+            'red': ((0.0, 1.0, 1.0),
+                    (0.5, 0.0, 0.0),
+                    (1.0, 0.0, 0.0)),
+            'green':((0.0, 1.0, 1.0),
+                    (0.5, 0.0, 0.0),
+                    (1.0, 0.0, 0.0)),
+            'blue': ((0.0, 0.0, 0.0),
+                    (0.5, 0.0, 0.0),
                     (1.0, 1.0, 1.0))}
         heatmap_cmap = matplotlib.colors.LinearSegmentedColormap('my_colormap', heatmapdict, 256)
         return heatmap_cmap

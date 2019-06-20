@@ -2,6 +2,7 @@ import pandas as pd
 import camoco as co
 import numpy as np
 import powerlaw
+import os
 
 from os import path
 
@@ -13,18 +14,30 @@ import matplotlib.pylab as plt
 
 def cob_health(args):
     log = coblog()
-    log('\n'
-        '-----------------------\n'
-        '   Network Health      \n'
-        '-----------------------\n'
+    log(f'\n'
+        f'-----------------------------\n'
+        f'   Network Health:{args.cob} \n'
+        f'-----------------------------\n'
     )
+    log(f"\nCreating reports in {os.getcwd()}\n\n")
+
     cob = co.COB(args.cob)
     if args.out is None:
         args.out = '{}_Health'.format(cob.name)
+    log(f'Output prefix: {args.out}')
+
 
     if args.edge_zscore_cutoff is not None:
         log("Changing Z-Score cutoff to {}",args.edge_zscore_cutoff)
         cob.set_sig_edge_zscore(args.edge_zscore_cutoff)
+
+    log('Printing Summary ---------------------------------------------------')
+    if not path.exists('{}.summary.txt'.format(args.out)):
+        with open('{}.summary.txt'.format(args.out),'w') as OUT:
+            # Print out the network summary
+            cob.summary(file=OUT)
+    else:
+        log('Skipped summary.')
 
     log('Plotting Scores ----------------------------------------------------') 
     if not path.exists('{}_CoexPCC_raw.png'.format(args.out)):
@@ -44,43 +57,36 @@ def cob_health(args):
         log('Skipped Norm.')
 
     log('Plotting Expression ------------------------------------------------')
-    if not path.exists('{}_Expr_raw.png'.format(args.out)):
-        cob.plot(
-            '{}_Expr_raw.png'.format(args.out),
-            include_accession_labels=True,
-            raw=True,
-            cluster_method=None
-        )
-    else:
-        log('Skipped raw.')
+   #if not path.exists('{}_Expr_raw.png'.format(args.out)):
+   #    cob.plot(
+   #        '{}_Expr_raw.png'.format(args.out),
+   #        include_accession_labels=True,
+   #        raw=True,
+   #        cluster_method=None
+   #    )
+   #else:
+   #    log('Skipped raw.')
     if not path.exists('{}_Expr_norm.png'.format(args.out)):
-        cob.plot(
+        cob.plot_heatmap(
             '{}_Expr_norm.png'.format(args.out),
             include_accession_labels=True,
             raw=False,
-            cluster_method='leaf',
+            cluster_method='ward',
             cluster_accessions=True
         )
     else:
         log('Skipped norm.')
-    log('Plotting Cluster Expression-----------------------------------------')
-    if not path.exists('{}_Expr_cluster.png'.format(args.out)):
-        cob.plot(
-            '{}_Expr_cluster.png'.format(args.out),
-            include_accession_labels=True,
-            raw=False,
-            cluster_accessions=True,
-            avg_by_cluster=True
-        )
-    else:
-        log('Skipped norm.')
-    log('Printing Summary ---------------------------------------------------')
-    if not path.exists('{}.summary.txt'.format(args.out)):
-        with open('{}.summary.txt'.format(args.out),'w') as OUT:
-            # Print out the network summary
-            cob.summary(file=OUT)
-    else:
-        log('Skipped summary.')
+   #log('Plotting Cluster Expression-----------------------------------------')
+   #if not path.exists('{}_Expr_cluster.png'.format(args.out)):
+   #    cob.plot(
+   #        '{}_Expr_cluster.png'.format(args.out),
+   #        include_accession_labels=True,
+   #        raw=False,
+   #        cluster_accessions=True,
+   #        avg_by_cluster=True
+   #    )
+   #else:
+   #    log('Skipped norm.')
 
     log('Printing QC Statistics ---------------------------------------------')
     if args.refgen is not None:
@@ -99,15 +105,12 @@ def cob_health(args):
         else:
             log('Skipped QC summary.')
 
-    #if not path.exists('{}_CisTrans.png'.format(args.out)):
-        # Get trans edges
-
     log('Plotting Degree Distribution ---------------------------------------')
     if not path.exists('{}_DegreeDist.png'.format(args.out)):
         degree = cob.degree['Degree'].values
-        #Using powerlaw makes run-time warning the first time you use it.
-        #This is still an open issue on the creators github.
-        #The creator recommends removing this warning as long as there is a fit.
+        # Using powerlaw makes run-time warning the first time you use it.
+        # This is still an open issue on the creators github.
+        # The creator recommends removing this warning as long as there is a fit.
         np.seterr(divide='ignore', invalid='ignore')
         fit = powerlaw.Fit(degree,discrete=True,xmin=1)
         # get an axis
@@ -137,8 +140,14 @@ def cob_health(args):
     else:
         log('Skipping Degree Dist.')
 
-    log('Plotting GO --------------------------------------------------------')
     if args.go is not None:
+        log('Plotting GO --------------------------------------------------------')
+        # Set the alpha based on the tails
+        if args.two_tailed == True:
+            alpha = 0.05 /2
+        else:
+            alpha = 0.05
+        # Generate the GO Table
         if not path.exists('{}_GO.csv'.format(args.out)):
             go = co.GOnt(args.go)
             term_ids = []
@@ -149,6 +158,7 @@ def cob_health(args):
             term_sizes = []
             term_desc = []
             terms_tested = 0
+            # max_terms limits the number of GO terms tested (sub-sampling)
             if args.max_terms is not None:
                 log('Limiting to {} GO Terms',args.max_terms)
                 terms = go.rand(
@@ -157,27 +167,22 @@ def cob_health(args):
                     max_term_size=args.max_term_size
                 )
             else:
+                # Else do the whole set (default is terms between 10 and 300 genes)
                 terms = go.iter_terms(
                     min_term_size=args.min_term_size,
                     max_term_size=args.max_term_size
                 )
             for term in terms:
+                # Some terms will lose genes that are not in networks
                 term.loci = list(filter(lambda x: x in cob, term.loci))
+                # Skip terms that are not an adequate size
                 if len(term) < args.min_term_size or len(term) > args.max_term_size:
                     continue
-                #set density value for two tailed go so we only test it once
+                # set density value for two tailed go so we only test it once
                 density = cob.density(term.loci)
-                #one tailed vs two tailed test
-                if args.two_tailed_GO is False:
-                    #run one tail for only positive values
-                    if density > 0:
-                        density_emp.append(density)
-                    #skip negative density values
-                    else:
-                        continue
-                #if two_tailed_go is not none
-                else:
-                    density_emp.append(density)
+                # one tailed vs two tailed test
+                density_emp.append(density)
+                # 
                 term_ids.append(term.id)
                 term_sizes.append(len(term))
                 term_desc.append(str(term.desc))
@@ -224,6 +229,13 @@ def cob_health(args):
                 'locality' : locality_emp,
                 'locality_pval' : locality_pvals
             })
+            # Calculate significance
+            go_enrichment['density_significant'] = go_enrichment.density_pval < alpha
+            go_enrichment['locality_significant'] = go_enrichment.locality_pval < alpha
+            # Calculate bonferonni
+            go_enrichment['density_bonferroni'] = go_enrichment.density_pval < (alpha / len(go_enrichment))
+            go_enrichment['locality_bonferroni'] = go_enrichment.locality_pval < (alpha / len(go_enrichment))
+            # Store the GO results in a CSV
             go_enrichment\
                 .sort_values(by='density_pval',ascending=True)\
                 .to_csv('{}_GO.csv'.format(args.out),index=False)
@@ -244,34 +256,41 @@ def cob_health(args):
                 go_enrichment.loc[np.logical_not(np.isfinite(go_enrichment['density_pval'])),'density_pval'] = max_density + 1
                 go_enrichment.loc[np.logical_not(np.isfinite(go_enrichment['locality_pval'])),'locality_pval'] = max_locality + 1
             plt.clf()
-            figure,axes = plt.subplots(3,2,figsize=(12,12))
-            # Calculate alpha based on one- or two-tails
-            if args.two_tailed_GO == True:
-                alpha = 0.05 / 2
+            # Calculate the transparency based on the number of terms
+            if len(go_enrichment) > 20:
+                transparency_alpha = 0.05
             else:
-                alpha = 0.05
+                transparency_alpha = 1
+
+            # --------------------------------------------------------------------
+            # Start Plotting
+            figure,axes = plt.subplots(3,2,figsize=(12,12))
             # -----------
             # Density
             # ----------
+            log_alpha = -1 *np.log10(alpha)
             axes[0,0].scatter(
                 go_enrichment['density'],
                 go_enrichment['density_pval'],
-                alpha=0.05,
+                alpha=transparency_alpha,
                 color='blue'
             )
             axes[0,0].set_xlabel('Empirical Density (Z-Score)')
             axes[0,0].set_ylabel('Bootstraped -log10(p-value)')
-            fold = sum(np.array(go_enrichment['density_pval'])>np.log10(alpha))/(alpha * len(go_enrichment))
+            fold = sum(np.array(go_enrichment['density_pval'])> log_alpha )/(alpha * len(go_enrichment))
             axes[0,0].axhline(y=-1*np.log10(0.05),color='red')
             axes[0,0].text(
-                min(axes[0,0].get_xlim()),-1*np.log10(alpha),
+                min(axes[0,0].get_xlim()),
+                -1*np.log10(alpha) + 0.1,
                 '{:.3g} Fold Enrichement'.format(fold),
                 color='red'
             )
+            axes[0,0].set_title('Density Health')
+            # Plot pvalue by term size
             axes[1,0].scatter(
                 go_enrichment['size'],
                 go_enrichment['density_pval'],
-                alpha=0.05,
+                alpha=transparency_alpha,
                 color='blue'
             )
             axes[1,0].set_ylabel('Bootstrapped -log10(p-value)')
@@ -280,13 +299,14 @@ def cob_health(args):
             axes[2,0].scatter(
                 go_enrichment['size'],
                 go_enrichment['density'],
-                alpha=0.05,
+                alpha=transparency_alpha,
                 color='blue'
             )
+            # Plot raw density by term size
             axes[2,0].scatter(
-                go_enrichment.query('density_pval>1.3')['size'],
-                go_enrichment.query('density_pval>1.3')['density'],
-                alpha=0.05,
+                go_enrichment.query(f'density_pval>{log_alpha}')['size'],
+                go_enrichment.query(f'density_pval>{log_alpha}')['density'],
+                alpha=transparency_alpha,
                 color='r'
             )
             axes[2,0].set_ylabel('Density')
@@ -297,22 +317,24 @@ def cob_health(args):
             axes[0,1].scatter(
                 go_enrichment['locality'],
                 go_enrichment['locality_pval'],
-                alpha=0.05,
+                alpha=transparency_alpha,
                 color='blue'
             )
             axes[0,1].set_xlabel('Empirical Locality (Residual)')
             axes[0,1].set_ylabel('Bootstraped -log10(p-value)')
-            fold = sum(np.array(go_enrichment['locality_pval'])>1.3)/(0.05 * len(go_enrichment))
+            fold = sum(np.array(go_enrichment['locality_pval'])>log_alpha)/(0.05 * len(go_enrichment))
             axes[0,1].axhline(y=-1*np.log10(0.05),color='red')
             axes[0,1].text(
-                min(axes[0,1].get_xlim()),-1*np.log10(0.05),
+                min(axes[0,1].get_xlim()),
+                -1*np.log10(alpha),
                 '{:.3g} Fold Enrichement'.format(fold),
                 color='red'
             )
+            axes[0,1].set_title('Locality Health')
             axes[1,1].scatter(
                 go_enrichment['size'],
                 go_enrichment['locality_pval'],
-                alpha=0.05,
+                alpha=transparency_alpha,
                 color='blue'
             )
             axes[1,1].set_xlabel('Term Size')
@@ -321,13 +343,13 @@ def cob_health(args):
             axes[2,1].scatter(
                 go_enrichment['size'],
                 go_enrichment['locality'],
-                alpha=0.05,
+                alpha=transparency_alpha,
                 color='blue' 
             )
             axes[2,1].scatter(
-                go_enrichment.query('locality_pval>1.3')['size'],
-                go_enrichment.query('locality_pval>1.3')['locality'],
-                alpha=0.05,
+                go_enrichment.query(f'locality_pval>{log_alpha}')['size'],
+                go_enrichment.query(f'locality_pval>{log_alpha}')['locality'],
+                alpha=transparency_alpha,
                 color='r'
             )
             axes[2,1].set_ylabel('Locality')

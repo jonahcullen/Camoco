@@ -7,9 +7,10 @@ from .RefGen import RefGen
 from .Locus import Locus
 from .Tools import log,rawFile
 
-from collections import defaultdict
+from collections import defaultdict,Counter
 from itertools import chain
 from functools import lru_cache
+from matplotlib import pylab as plt
 
 import pandas as pd
 import apsw as lite
@@ -54,8 +55,6 @@ class GOTerm(Term):
         is_a=None, loci=None, **kwargs):
         '''
             Initialize a GOTerm
-
-            Parameters
         '''
         super().__init__(id, desc=desc, loci=loci, **kwargs)
         self.name = name
@@ -105,6 +104,8 @@ class GOnt(Ontology):
     def __getitem__(self, id):
         if isinstance(id,str):
             return self.get_term(id)
+        elif isinstance(id,GOTerm):
+            return self.get_term(id.id)
         else:
             return [self.get_term(x) for x in id]
 
@@ -241,6 +242,17 @@ class GOnt(Ontology):
             for grand_parent in self.parents(self[parent_term]):
                 yield grand_parent
 
+    def children(self,term):
+        '''
+            Returns an iterable containing the children of a term.
+            Children are determined via the is_a property of the term.
+        '''
+        term = self[term]
+        children_ids = [x[0] for x in self.db.cursor().execute(
+            'SELECT child FROM rels WHERE parent = ?',(term.id,)
+        )]
+        return [self[x] for x in children_ids]
+
     def graph(self, terms=None):
         '''
             Create a NetworkX graph from terms
@@ -298,6 +310,122 @@ class GOnt(Ontology):
                     x.attrs['label'] = '{},{}'.format(x.attrs['label'],term.attrs['label'])
         return self.to_json(terms=list(unique_terms.values()),filename=filename)
 
+    def to_sparse_matrix(self):
+        '''
+            Create a sparse matrix view of term interactions
+        '''
+        from scipy import sparse
+        terms = list(self.iter_terms())
+        term_index = {t.id:i for i,t in enumerate(terms)}
+        nlen = len(terms)
+        row = []
+        col = []
+        data = []
+        for term in terms:
+            for parent in term.is_a:
+                row.append(term_index[term.id])
+                col.append(term_index[parent])
+                data.append(1)   
+        # make the matrix symmetric
+        d = data + data
+        r = row + col
+        c = col + row
+        matrix = sparse.coo_matrix((d,(r,c)), shape=(nlen,nlen),dtype=None)
+        return (matrix,term_index)
+
+
+
+    def _coordinates(self,iterations=100,force=False,ignore_orphans=True):
+        from fa2 import ForceAtlas2
+        forceatlas2 = ForceAtlas2(
+            outboundAttractionDistribution=False,
+            linLogMode=False,
+            adjustSizes=False,
+            edgeWeightInfluence=1.0,
+            jitterTolerance=1.0,
+            barnesHutOptimize=True,
+            barnesHutTheta=1.2,
+            multiThreaded=False,
+            scalingRatio=2.0,
+            strongGravityMode=False,
+            gravity=1.0,
+            verbose=True
+        )
+        pos = self._bcolz('coordinates')
+        if pos is None or force == True:
+            import scipy.sparse.csgraph as csgraph
+            import networkx
+            A,i = self.to_sparse_matrix()
+            # generate a reverse lookup for index to label
+            rev_i = {v:k for k,v in i.items()}
+            num,ccindex = csgraph.connected_components(A,directed=False)
+            # convert to csc
+            self.log(f'Converting to compressed sparse column')
+            L = A.tocsc()
+            connected_components = Counter(ccindex)
+            component_coordinates = []
+            offset = None
+            for index,csize in sorted(connected_components.items(),key=lambda x: x[1],reverse=True): 
+                if csize == 1 and ignore_orphans:
+                    continue
+                C = L[ccindex == index,:][:,ccindex == index]
+                (c_indices,) = np.where(ccindex == index)
+                labels = [rev_i[x] for x in c_indices]
+                self.log(f'Calculating positions for component {index} (n={csize})')
+                coordinates = positions = forceatlas2.forceatlas2(C,pos=None,iterations=iterations)
+                coordinates = pd.DataFrame(
+                    coordinates, index=labels, columns = ['x','y']        
+                )
+                if offset is not None:
+                    # shift the x coordinates to 0
+                    coordinates.x = coordinates.x + abs(coordinates.x.min()) + offset
+                offset = coordinates.x.max()
+                component_coordinates.append(coordinates)
+            pos = pd.concat(component_coordinates)
+            self._bcolz('coordinates',df=pos)
+        return pos
+
+    def plot_network(self,terms=None,remove_orphans=True):
+        '''
+
+        '''
+        # Get term objects
+        terms = [self[x] for x in terms]
+        # get coordinates
+        coor = self._coordinates()
+        fig = plt.figure(
+            facecolor='white',
+            figsize=(20,20)
+        )
+        ax = fig.add_subplot(111)
+        ax.set_facecolor('white')
+        ax.grid(False)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        # Keep track of genes to plot
+        background_terms = set()
+        if terms is not None:
+            highlighted_terms = set(terms)
+        else:
+            highlighted_terms = set()
+        # plot the edges
+        for term in self.iter_terms():
+            if remove_orphans and len(term.is_a) == 0 and self.num_children(term) == 0:
+                    continue
+            else:
+                background_terms.add(term)
+            for parent in term.is_a:
+                tcor = coor.loc[term.id]
+                pcor = coor.loc[parent]
+                ax.plot([tcor.x,pcor.x],[tcor.y,pcor.y],'gray',alpha=0.7,zorder=1)
+        # plot the genes
+        background_terms = coor.loc[[x.id for x in background_terms],:]
+        ax.scatter(background_terms.x,background_terms.y,alpha=1,zorder=2)
+        # plot the highlighted terms
+        highlighted_terms = coor.loc[[x.id for x in highlighted_terms],:]
+        ax.scatter(highlighted_terms.x,highlighted_terms.y,alpha=1,zorder=3)
+        return fig
+
     def to_json(self,filename=None,terms=None):
         '''
             Create a JSON representation of a Gene Ontology
@@ -324,7 +452,6 @@ class GOnt(Ontology):
             if term.id not in seen_nodes:
                 seen_nodes[term.id] = node_data
             else:
-
                 seen_nodes[term.id].update(node_data)
             #seen_nodes[term.id].update(node_data)
             for parent in term.is_a:
@@ -418,6 +545,8 @@ class GOnt(Ontology):
             if headers:
                 garb = INMAP.readline()
             for line in INMAP.readlines():
+                if line.startswith('#') or line.startswith('!'):
+                    continue
                 row = line.strip('\n').split('\t')
                 gene = row[id_col].split('_')[0].strip()
                 cur_term = row[go_col]
@@ -456,7 +585,16 @@ class GOnt(Ontology):
         self.log('Your gene ontology is built.')
         return self
 
-         
+        
+    def num_children(self, term):
+        '''
+            Returns the number of children terms a term has
+        '''
+        term = self[term]
+        return self.db.cursor().execute(
+            'SELECT COUNT(child)  FROM rels WHERE parent = ?',
+            (term.id,)
+        ).fetchone()[0]
 
     @classmethod
     def from_obo(cls, obo_file, gene_map_file ,name, description, 
@@ -534,8 +672,19 @@ class GOnt(Ontology):
             cur.execute('ALTER TABLE terms ADD COLUMN name TEXT;')
         except lite.SQLError:
             pass
-        cur.execute('CREATE TABLE IF NOT EXISTS rels (parent TEXT, child TEXT);')
-        cur.execute('CREATE TABLE IF NOT EXISTS alts (alt TEXT UNIQUE, main TEXT);')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS rels (
+                parent TEXT, 
+                child TEXT,
+                PRIMARY KEY(parent, child)
+            );
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS alts (
+                alt TEXT UNIQUE, 
+                main TEXT
+            );
+        ''')
 
     def _clear_tables(self):
         super()._clear_tables()
